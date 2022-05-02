@@ -1,0 +1,20 @@
+[package]
+name = "strumyk"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde_bencode = "^0.2.3"
+serde = "^1.0.0"
+serde_derive = "^1.0.0"
+serde_bytes = "0.11"
+sha-1 = "0.10.0"
+reqwest = { version = "0.11", features = ["blocking"] }
+form_urlencoded = "1.0.1"
+tokio = { version = "1.17", features = ["full"] }
+bytes = "1.1"
+rand = "0.8.5"
+bitvec = "1"
+hex-string = "0.1.0"

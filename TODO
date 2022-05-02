@@ -1,0 +1,2 @@
+1. Hyper TLS client to fetch announce and get peer list
+2. connect to peer -> tcpstream - test with local utorrent?
