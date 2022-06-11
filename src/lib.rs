@@ -12,21 +12,22 @@ use sha1::{Sha1, Digest};
 use bytes::{BufMut, Bytes, BytesMut, Buf};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc};
 use std::{fmt, io::Cursor};
 use tokio::fs::File;
 use hex_string::HexString;
 use bitvec::prelude::*;
 
 
-pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn Error+Send+Sync>>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MetaInfo {
     pub announce: String,
     pub info: Info,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Info {
     pub name: String,
     #[serde(rename = "piece length")]
@@ -81,7 +82,6 @@ pub async fn send_handshake(stream: &mut TcpStream, handshake: Handshake) -> Res
     stream.write_all(&header).await?;
     stream.write_all(&handshake.info_hash).await?;
     stream.write_all(&handshake.peer_id).await?;
-
 
     return Ok(())
 }
@@ -264,12 +264,29 @@ impl Connection {
                 Ok(Some(msg))
             },
             Err(MsgError::Incomplete) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                Err(e.to_string().into())
+            }
         }
     }
 }
 
-pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo) -> Result<()> {
+#[derive(Debug)]
+pub enum PeerCommand {
+    RequestPiece{
+        index: u32,
+    },
+    Exit,
+}
+#[derive(Debug)]
+pub enum PeerUpdate {
+    Unchoked,
+    Choked,
+    FinishedPiece{index: u32},
+}
+
+pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo,
+     mut commands: mpsc::Receiver<PeerCommand>, updates: mpsc::Sender<PeerUpdate>) -> Result<()> {
     // receive bitfield,  send interested,
     // wait for unchoke, then request block and wait for piece
     let handshake = Handshake{
@@ -286,45 +303,61 @@ pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo) -> Result<()> {
     let mut buffer = BytesMut::with_capacity(piece_size as usize);
     const BLOCK_SIZE: u32 = 16384;
     let reqs_per_piece = piece_size / BLOCK_SIZE as i64;
-    let mut idx = 1;
+    let mut block_idx = 1;
     loop {
-        match connection.read_msg().await? {
-            None => {},
-            Some(msg) => {
-                match PeerMessage::from(msg) {
-                    PeerMessage::Choke => _choked = true,
-                    PeerMessage::Bitfield{bits} => {
-                        _bitfield = bits;
-                        connection.write_msg(&Message::from(PeerMessage::Interested{})).await?;
-                    },
-                    PeerMessage::Unchoke => {
-                        connection.write_msg(&Message::from(PeerMessage::Request{index: 0, begin: 0, length: BLOCK_SIZE})).await?;
-                    }
-                    PeerMessage::Piece{index: _index,  begin: _begin, data} => {
-                        buffer.extend_from_slice(&data);
-                        println!("Received block with id: {}", idx);
-                        if idx < reqs_per_piece {
-                        connection.write_msg(&Message::from(PeerMessage::Request{index: 0, begin: BLOCK_SIZE * idx as u32, length: BLOCK_SIZE})).await?;
-                        idx += 1;
-                        } else {
-                            let mut file = File::create("piece0").await?;
-                            file.write_all(&buffer).await?;
-                            let hs = HexString::from_bytes(&Vec::from(&info.info.pieces[0..20]));
-                            println!("Expected hash: {:?}", hs);
-                            let mut hasher = Sha1::new();
-                            hasher.update(buffer);
-                            let hs2 = HexString::from_bytes(&hasher.finalize()[..].into());
-                            println!("Buffer hash: {:?}", hs2);
-                            break;
+        tokio::select!{
+            msg =  connection.read_msg() => {
+                match msg? {
+                    None => {},
+                    Some(msg) => {
+                        match PeerMessage::from(msg) {
+                            PeerMessage::Choke => _choked = true,
+                            PeerMessage::Bitfield{bits} => {
+                                _bitfield = bits;
+                                connection.write_msg(&Message::from(PeerMessage::Interested{})).await?;
+                            },
+                            PeerMessage::Unchoke => {
+                                updates.send(PeerUpdate::Unchoked{}).await?;
+                            }
+                            PeerMessage::Piece{index,  begin: _begin, data} => {
+                                buffer.extend_from_slice(&data);
+                                println!("Received block with index: {} and id: {}", index, block_idx);
+                                if block_idx < reqs_per_piece {
+                                //TODO: index should be saved from request 
+                                connection.write_msg(&Message::from(PeerMessage::Request{index: index, begin: BLOCK_SIZE * block_idx as u32, length: BLOCK_SIZE})).await?;
+                                block_idx += 1;
+                                } else {
+                                    let filename = format!("piece{}", index);
+                                    let mut file = File::create(filename).await?;
+                                    file.write_all(&buffer).await?;
+                                    let hs_idx = (20 * index) as usize;
+                                    let hs = HexString::from_bytes(&Vec::from(&info.info.pieces[hs_idx..hs_idx+20]));
+                                    println!("Expected hash: {:?}", hs);
+                                    let mut hasher = Sha1::new();
+                                    hasher.update(buffer);
+                                    let hs2 = HexString::from_bytes(&hasher.finalize()[..].into());
+                                    println!("Buffer hash: {:?}", hs2);
+                                    assert_eq!(hs, hs2);
+                                    buffer = BytesMut::with_capacity(piece_size as usize);
+                                    block_idx = 1;
+                                    updates.send(PeerUpdate::FinishedPiece{index}).await?;
+                                }
+                            }
+                            _ => unimplemented!()
                         }
                     }
-
-                    _ => unimplemented!()
+                }
+            },
+            Some(cmd) = commands.recv() => {
+                match cmd {
+                    PeerCommand::RequestPiece{index} => {
+                        connection.write_msg(&Message::from(PeerMessage::Request{index: index, begin: 0, length: BLOCK_SIZE})).await?;
+                    },
+                    PeerCommand::Exit => { break; }
                 }
             }
         }
     }
-
     Ok(())
 }
 
