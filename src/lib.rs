@@ -4,6 +4,7 @@ extern crate serde_bytes;
 #[macro_use]
 extern crate serde_derive;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::error::Error;
 use serde_bencode::de;
@@ -17,9 +18,13 @@ use std::{fmt, io::Cursor};
 use tokio::fs::File;
 use hex_string::HexString;
 use bitvec::prelude::*;
+use tokio::time;
+use std::time::Duration;
 
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error+Send+Sync>>;
+
+const BLOCK_SIZE: u32 = 16384;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct MetaInfo {
@@ -169,9 +174,11 @@ impl Message {
             return Err(MsgError::Incomplete);
         }
         let len = input.get_i32();
+        println!("check length: {}", len);
         if input.remaining() < len as usize {
             return Err(MsgError::Incomplete);
         }
+        //todo: != 0
         input.advance(len as usize);
         Ok(())
     }
@@ -283,6 +290,79 @@ pub enum PeerUpdate {
     Unchoked,
     Choked,
     FinishedPiece{index: u32},
+    Downloaded{bytes: u32}
+}
+
+pub struct BlockStorage {
+    blocks: HashMap<u32, [Bytes; 16]>,
+    completed: HashMap<u32, [bool; 16]>,
+    info: Info,
+}
+
+impl BlockStorage {
+    pub fn new(info: Info) -> BlockStorage {
+        BlockStorage {
+            blocks: HashMap::new(),
+            completed: HashMap::new(),
+            info,
+        }
+    }
+
+    pub fn insert_block(&mut self, piece_idx: u32, block_idx: usize, data: Bytes) {
+        if !self.blocks.contains_key(&piece_idx) {
+            const EMPTY_BYTES: Bytes = Bytes::new();
+            self.blocks.insert(piece_idx, [EMPTY_BYTES; 16]);
+            self.completed.insert(piece_idx, [false; 16]);
+        }
+        self.blocks.get_mut(&piece_idx).unwrap()[block_idx] = data;
+        self.completed.get_mut(&piece_idx).unwrap()[block_idx] = true;
+    }
+
+    pub fn is_completed(&self, piece_idx: u32) -> bool {
+        //TODO handle non-existence gracefully
+        if piece_idx == last_piece_index(&self.info) {
+            self.completed.get(&piece_idx).unwrap().iter().take(blocks_in_last_piece(&self.info)).all(|&e| e == true)
+        } else {
+            self.completed.get(&piece_idx).unwrap().iter().all(|&e| e == true)
+        }
+    }
+
+    pub async fn flush_piece(&mut self, piece_idx: u32) -> Result<()> {
+        if !self.is_completed(piece_idx) {
+            return Err("Flushing incomplete piece".to_string().into());
+        }
+
+        let buffer = self.blocks.remove(&piece_idx).unwrap();
+
+        let hs_idx = (20 * piece_idx) as usize;
+        let hs = HexString::from_bytes(&Vec::from(&self.info.pieces[hs_idx..hs_idx+20]));
+        println!("Expected hash: {:?}", hs);
+        let mut hasher = Sha1::new();
+        for block in buffer.iter() {
+            hasher.update(&block);
+        }
+        let hs2 = HexString::from_bytes(&hasher.finalize()[..].into());
+        println!("Buffer hash: {:?}", hs2);
+
+        //TODO: return result-failure, clear blocks
+        assert_eq!(hs, hs2);
+
+        let filename = format!("piece{}", piece_idx);
+        let mut file = File::create(filename).await?;
+        for block in buffer.iter() {
+            file.write_all(&block).await?;
+        }
+        Ok(())
+    }
+}
+
+fn last_piece_index(info: &Info) -> u32 {
+    (info.pieces.len() / 20 - 1) as u32
+}
+
+fn blocks_in_last_piece(info: &Info) -> usize {
+    let size_of_last_piece = info.length.unwrap() - (info.piece_length * last_piece_index(&info) as i64);
+    ((size_of_last_piece / BLOCK_SIZE as i64)  + 1) as usize
 }
 
 pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo,
@@ -300,10 +380,12 @@ pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo,
     let mut _bitfield: BitVec<u8, Msb0>;
     let piece_size = info.info.piece_length;
     println!("Piece length: {}", piece_size);
-    let mut buffer = BytesMut::with_capacity(piece_size as usize);
-    const BLOCK_SIZE: u32 = 16384;
+
     let reqs_per_piece = piece_size / BLOCK_SIZE as i64;
-    let mut block_idx = 1;
+    let mut downloaded_bytes = 0;
+    let mut interval_timer = time::interval(Duration::from_secs(1));
+
+    let mut block_storage = BlockStorage::new(info.info.clone());
     loop {
         tokio::select!{
             msg =  connection.read_msg() => {
@@ -319,27 +401,14 @@ pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo,
                             PeerMessage::Unchoke => {
                                 updates.send(PeerUpdate::Unchoked{}).await?;
                             }
-                            PeerMessage::Piece{index,  begin: _begin, data} => {
-                                buffer.extend_from_slice(&data);
+                            PeerMessage::Piece{index, begin, data} => {
+                                downloaded_bytes += data.len();
+                                let block_idx = (begin / BLOCK_SIZE) as usize;
                                 println!("Received block with index: {} and id: {}", index, block_idx);
-                                if block_idx < reqs_per_piece {
-                                //TODO: index should be saved from request 
-                                connection.write_msg(&Message::from(PeerMessage::Request{index: index, begin: BLOCK_SIZE * block_idx as u32, length: BLOCK_SIZE})).await?;
-                                block_idx += 1;
-                                } else {
-                                    let filename = format!("piece{}", index);
-                                    let mut file = File::create(filename).await?;
-                                    file.write_all(&buffer).await?;
-                                    let hs_idx = (20 * index) as usize;
-                                    let hs = HexString::from_bytes(&Vec::from(&info.info.pieces[hs_idx..hs_idx+20]));
-                                    println!("Expected hash: {:?}", hs);
-                                    let mut hasher = Sha1::new();
-                                    hasher.update(buffer);
-                                    let hs2 = HexString::from_bytes(&hasher.finalize()[..].into());
-                                    println!("Buffer hash: {:?}", hs2);
-                                    assert_eq!(hs, hs2);
-                                    buffer = BytesMut::with_capacity(piece_size as usize);
-                                    block_idx = 1;
+
+                                block_storage.insert_block(index, block_idx, data);
+                                if block_storage.is_completed(index) {
+                                    block_storage.flush_piece(index).await?;
                                     updates.send(PeerUpdate::FinishedPiece{index}).await?;
                                 }
                             }
@@ -351,10 +420,17 @@ pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo,
             Some(cmd) = commands.recv() => {
                 match cmd {
                     PeerCommand::RequestPiece{index} => {
-                        connection.write_msg(&Message::from(PeerMessage::Request{index: index, begin: 0, length: BLOCK_SIZE})).await?;
+                        //TODO: this is quite inefficient - move to dedicated block level picker that will drive this
+                        for i in 0..(reqs_per_piece+1) as u32 {
+                            connection.write_msg(&Message::from(PeerMessage::Request{index: index, begin: i * BLOCK_SIZE, length: BLOCK_SIZE})).await?;
+                        }
                     },
                     PeerCommand::Exit => { break; }
                 }
+            },
+            _ = interval_timer.tick() => {
+                updates.send(PeerUpdate::Downloaded{bytes:downloaded_bytes as u32}).await?;
+                downloaded_bytes = 0;
             }
         }
     }

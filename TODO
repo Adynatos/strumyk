@@ -1,2 +1,8 @@
 1. Hyper TLS client to fetch announce and get peer list
-2. connect to peer -> tcpstream - test with local utorrent?
+2. Create some layer that will request blocks up to connection limit (probably can be a function now, with semaphore or some shit)
+3. Calculate download speed.
+4. Convert everything to same integer size -> probably i64/u64
+4. Allow for bigger req queue -> request blocks from multiple pieces (maybe just keep score of how many req we can have for given peer)
+5. Have actual piece picker - update info from bitsets, only request for pieces that peer have
+6. Start working on download from multiple peers, run two clients on local net
+7. Start seeding (should be realitvely easy now, just handle new msgs..)
