@@ -6,3 +6,11 @@
 5. Have actual piece picker - update info from bitsets, only request for pieces that peer have
 6. Start working on download from multiple peers, run two clients on local net
 7. Start seeding (should be realitvely easy now, just handle new msgs..)
+8. Start timer when requesting piece, resend when not received in time..
+9. Some simple ui in curses
+
+
+Pass torrent file as argument to run..
+
+PiecePicker plan:
+collect list of pieces we have

@@ -3,7 +3,8 @@ use std::{error::Error, path::Path};
 use std::env;
 use std::fs::{self, File};
 use std::io;
-use strumyk::{parse_torrent, peer_handler, PeerUpdate, PeerCommand};
+use bitvec::prelude::*;
+use strumyk::{PeerCommand, PeerUpdate, PiecePicker, parse_torrent, peer_handler};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>>
@@ -11,7 +12,7 @@ async fn main() -> Result<(), Box<dyn Error>>
     let args: Vec<String> = env::args().collect();
     let addr = format!("127.0.0.1:{}", args[1]);
     let stream = TcpStream::connect(addr).await?;
-    let path = Path::new("ubuntu-21.10-desktop-amd64.iso.torrent");
+    let path = Path::new("ubuntu-20.04.5-desktop-amd64.iso.torrent");
     let torrent = parse_torrent(path);
 
     let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(32);
@@ -29,14 +30,23 @@ async fn main() -> Result<(), Box<dyn Error>>
     let mut paths = paths.flat_map(|e| e.parse::<u32>()).collect::<Vec<u32>>();
     paths.sort();
 
-    let mut piece_idx = if let Some(&v) = paths.last() { v } else { 0u32 };
     let num_of_pieces: u32 = (torrent.info.pieces.len() / 20) as u32;
     println!("Num of pieces: {}", num_of_pieces);
-    println!("Last received: {}", piece_idx);
+
+    let mut bs = BitVec::new();
+    bs.resize(num_of_pieces as usize, false);
+    for path in paths.iter() {
+      bs.set(*path as usize, true);
+    }
+
 
     let mut max_outstanding_reqs = 8;
     let mut queued_requests = 0;
 
+    let mut piece_picker = PiecePicker::new(num_of_pieces, bs); //TODO: get bitset, update bitset
+    let mut piece_idx = 0;
+
+//todo: update
     while let Some(update) = updates_rx.recv().await {
       match update {
         PeerUpdate::Choked => { choked = true; },
@@ -44,11 +54,12 @@ async fn main() -> Result<(), Box<dyn Error>>
           choked = false;
           if queued_requests < max_outstanding_reqs {
             queued_requests += 1;
+            piece_idx = piece_picker.next(0);
             commands_tx.send(PeerCommand::RequestPiece{index: piece_idx}).await?;
           }
         }
-        PeerUpdate::FinishedPiece{index} => {
-          piece_idx = index + 1;
+        PeerUpdate::FinishedPiece{index: _} => {
+          piece_idx = piece_picker.next(0);
           queued_requests -= 1;
           if piece_idx == num_of_pieces {
             commands_tx.send(PeerCommand::Exit{}).await?;
@@ -65,8 +76,12 @@ async fn main() -> Result<(), Box<dyn Error>>
           println!("Download speed: {}kB/s", bytes/1024);
           println!("Piece len: {}", torrent.info.piece_length as u32);
           let queue_size = bytes / 0x400; //From https://blog.libtorrent.org/2011/11/requesting-pieces/
-          max_outstanding_reqs = std::cmp::max(queue_size / torrent.info.piece_length as u32, 4);
+          max_outstanding_reqs = std::cmp::max(queue_size / torrent.info.piece_length as u32, 16);
           println!("Queue size: {}", max_outstanding_reqs);
+        },
+        PeerUpdate::Bitfield{bits} => {
+          let peer_id = 0;
+          piece_picker.update(peer_id, bits)
         }
       }
     }

@@ -5,8 +5,11 @@ extern crate serde_bytes;
 extern crate serde_derive;
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::io::Write;
 use std::path::Path;
 use std::error::Error;
+use std::u8;
 use serde_bencode::de;
 use serde_bytes::ByteBuf;
 use sha1::{Sha1, Digest};
@@ -15,9 +18,9 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc};
 use std::{fmt, io::Cursor};
-use tokio::fs::File;
 use hex_string::HexString;
 use bitvec::prelude::*;
+use std::fs::File;
 use tokio::time;
 use std::time::Duration;
 
@@ -289,10 +292,12 @@ pub enum PeerCommand {
 pub enum PeerUpdate {
     Unchoked,
     Choked,
+    Bitfield{bits: BitVec<u8, Msb0>},
     FinishedPiece{index: u32},
     Downloaded{bytes: u32}
 }
 
+//TODO: make generic over nr of blocks
 pub struct BlockStorage {
     blocks: HashMap<u32, [Bytes; 16]>,
     completed: HashMap<u32, [bool; 16]>,
@@ -348,10 +353,13 @@ impl BlockStorage {
         assert_eq!(hs, hs2);
 
         let filename = format!("piece{}", piece_idx);
-        let mut file = File::create(filename).await?;
-        for block in buffer.iter() {
-            file.write_all(&block).await?;
-        }
+        tokio::task::spawn_blocking(move || { 
+            let mut file = std::io::BufWriter::new(File::create(filename).unwrap());
+            for block in buffer.iter() {
+                std::io::Write::write_all(&mut file, &block).unwrap();
+            }
+            file.flush().unwrap();
+        });
         Ok(())
     }
 }
@@ -395,7 +403,7 @@ pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo,
                         match PeerMessage::from(msg) {
                             PeerMessage::Choke => _choked = true,
                             PeerMessage::Bitfield{bits} => {
-                                _bitfield = bits;
+                                updates.send(PeerUpdate::Bitfield{bits}).await?;
                                 connection.write_msg(&Message::from(PeerMessage::Interested{})).await?;
                             },
                             PeerMessage::Unchoke => {
@@ -437,6 +445,61 @@ pub async fn peer_handler(mut stream: TcpStream, info: MetaInfo,
     Ok(())
 }
 
+type PeerId = u8;
+type PieceIdx = u32;
+
+pub struct PiecePicker {
+    //TODO: sort by rarest first when we got more than one peer
+    pieces: HashMap<PieceIdx, Vec<PeerId>>,
+    pieces_by_rarity: VecDeque<PieceIdx>,
+    completed: BitVec<u8, Msb0>,
+}
+
+impl PiecePicker {
+    pub fn new(num_of_pieces: u32, completed: BitVec<u8, Msb0>) -> Self {
+        let pieces = HashMap::new();
+        let pieces_by_rarity = VecDeque::with_capacity(num_of_pieces as usize);
+        PiecePicker{pieces, pieces_by_rarity, completed}
+    }
+
+    //TODO: rethink this for more peers plx
+    pub fn update(&mut self, peer_id: u8, bits: BitVec<u8, Msb0>) {
+        for (idx, bit) in bits.iter().enumerate() {
+            if bit == true && !self.completed[idx] {
+                if let Some(v) = self.pieces.get_mut(&(idx as u32)) {
+                    v.push(peer_id)
+                } else {
+                    self.pieces.insert(idx as u32, vec![peer_id]);
+                    self.pieces_by_rarity.push_back(idx as u32);
+                }
+            }
+        }
+        self.sort()
+    }
+
+    fn sort(&mut self) {
+        self.pieces_by_rarity.make_contiguous().sort_by_cached_key(|k| {
+            self.pieces[k].len();            
+        });
+    }
+
+    pub fn finished(&mut self, _index: u32) {
+        //This will be usefull when we will keep track of in progress downloads, now we assume we always succeed :<
+    }
+
+    pub fn next(&mut self, peer: PeerId) -> u32 {
+        for (idx, piece_idx) in self.pieces_by_rarity.clone().iter().enumerate() {
+            let piece = self.pieces.get(&piece_idx);
+            if let Some(piece) = piece {
+                if piece.contains(&peer) {
+                    self.pieces_by_rarity.remove(idx);
+                    return *piece_idx;
+                }
+            }
+        }
+        panic!("Error somehow we don't have piece for peer!")
+    }
+}
 
 #[cfg(test)]
 mod tests {

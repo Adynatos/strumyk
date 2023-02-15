@@ -4,7 +4,7 @@ use form_urlencoded;
 use strumyk::{hash_info, parse_torrent};
 
 fn main() {
-    let path = Path::new("ubuntu-21.10-desktop-amd64.iso.torrent");
+    let path = Path::new("ubuntu-20.04.5-desktop-amd64.iso.torrent");
     let torrent = parse_torrent(path);
     let hash = hash_info(&torrent);
     let announce = torrent.announce;
