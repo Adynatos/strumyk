@@ -1,6 +1,6 @@
-use std::path::Path;
-use reqwest;
 use form_urlencoded;
+use reqwest;
+use std::path::Path;
 use strumyk::{hash_info, parse_torrent};
 
 fn main() {
@@ -15,6 +15,5 @@ fn main() {
     //println!("url {}", url);
     let client = reqwest::blocking::Client::new();
     let req = client.get(url).query(&[("uploaded", 0)]).build().unwrap();
-   println!("{:?}", req);
-   
+    println!("{:?}", req);
 }
