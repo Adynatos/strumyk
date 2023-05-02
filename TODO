@@ -1,6 +1,6 @@
 1. Hyper TLS client to fetch announce and get peer list
 2. Create some layer that will request blocks up to connection limit (probably can be a function now, with semaphore or some shit)
-3. Calculate download speed.
+3. Calculate download speed. We need to keep it on peer to peer basis, will improve when designing choking algorithm
 4. Convert everything to same integer size -> probably i64/u64
 4. Allow for bigger req queue -> request blocks from multiple pieces (maybe just keep score of how many req we can have for given peer)
 5. Have actual piece picker - update info from bitsets, only request for pieces that peer have
@@ -14,3 +14,8 @@ Pass torrent file as argument to run..
 
 PiecePicker plan:
 collect list of pieces we have
+
+
+For timers we can use timeout from tokio::time
+start future for each request with timeout, bubble timeout to toplevel handler
+keep in transit pieces, move to completed on finished, return to be picked on timeout

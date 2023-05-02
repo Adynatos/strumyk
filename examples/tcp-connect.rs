@@ -14,20 +14,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let path = Path::new("ubuntu-20.04.5-desktop-amd64.iso.torrent");
     let torrent = parse_torrent(path);
 
-    let mut commands: HashMap<u8, tokio::sync::mpsc::Sender<PeerCommand>> = HashMap::new();
-    let (updates_tx, mut updates_rx) = tokio::sync::mpsc::channel(32);
-    for (peer_id, address) in addresses.into_iter().enumerate() {
-        let torrent = torrent.clone();
-        let updates_tx = updates_tx.clone();
-        let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(32);
-        let peer_id: u8 = peer_id as u8;
-        commands.insert(peer_id, commands_tx);
-        tokio::spawn(async move {
-            let stream = TcpStream::connect(address.clone()).await?;
-            peer_handler(peer_id as u8, stream, torrent, commands_rx, updates_tx).await
-        });
-    }
-
     let mut choked = true;
     let paths = fs::read_dir("./").unwrap();
     let paths = paths
@@ -53,8 +39,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut max_outstanding_reqs = 12;
     let mut queued_requests = 0;
 
-    let mut piece_picker = PiecePicker::new(num_of_pieces, bs); //TODO: get bitset, update bitset
+    let mut piece_picker = PiecePicker::new(num_of_pieces, bs.clone()); //TODO: get bitset, update bitset
     let mut piece_idx;
+
+    let mut commands: HashMap<u8, tokio::sync::mpsc::Sender<PeerCommand>> = HashMap::new();
+    let (updates_tx, mut updates_rx) = tokio::sync::mpsc::channel(32);
+    for (peer_id, address) in addresses.into_iter().enumerate() {
+        let torrent = torrent.clone();
+        let updates_tx = updates_tx.clone();
+        let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(32);
+        let peer_id: u8 = peer_id as u8;
+        commands.insert(peer_id, commands_tx);
+        let bs = bs.clone();
+        tokio::spawn(async move {
+            let stream = TcpStream::connect(address.clone()).await?;
+            peer_handler(peer_id as u8, stream, torrent, commands_rx, updates_tx, bs).await
+        });
+    }
 
     while let Some(update) = updates_rx.recv().await {
         match update {
@@ -71,7 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .await?;
                 }
             }
-            PeerUpdate::FinishedPiece { peer_id, index: _ } => {
+            PeerUpdate::FinishedPiece { peer_id, index } => {
                 piece_idx = piece_picker.next(peer_id);
                 queued_requests -= 1;
                 //TODO: new condition for end - we no longer download stuff sequentially
@@ -80,6 +81,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         peer.send(PeerCommand::Exit {}).await?;
                     }
                     break;
+                }
+                for tx in commands.values() {
+                    tx.send(PeerCommand::Have{index}).await?;
                 }
                 if !choked {
                     if queued_requests < max_outstanding_reqs {

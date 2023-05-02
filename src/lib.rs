@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fs::File;
+use std::io::Read;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -23,6 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
+use std::io::Seek;
+use std::io;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -112,6 +116,7 @@ impl fmt::Display for MsgError {
         }
     }
 }
+
 #[allow(dead_code)]
 #[derive(Debug)]
 enum PeerMessage {
@@ -132,10 +137,22 @@ impl From<Message> for PeerMessage {
             0 => PeerMessage::Choke {},
             1 => PeerMessage::Unchoke {},
             2 => PeerMessage::Interested {},
+            3 => PeerMessage::NotInterested{},
+            4 => {
+                let mut bytes = msg.payload.expect("Missing payload for Have");
+                PeerMessage::Have(bytes.get_u32())
+            }
             5 => {
                 let bytes = msg.payload.expect("Missing payload for bitfield");
                 let bv = BitVec::from_slice(&bytes);
                 PeerMessage::Bitfield { bits: bv }
+            }
+            6 => {
+                let mut bytes = msg.payload.expect("Missing payload for bitfield");
+                let index = bytes.get_u32();
+                let begin = bytes.get_u32();
+                let length = bytes.get_u32();
+                PeerMessage::Request { index, begin, length}
             }
             7 => {
                 let mut bytes = msg.payload.expect("Missing payload for pieces");
@@ -220,6 +237,15 @@ impl From<PeerMessage> for Message {
                 length: 1,
                 payload: None,
             },
+            PeerMessage::Have(piece) => {
+                let mut buf = BytesMut::new();
+                buf.put_u32(piece);
+                Message {
+                    id: 4,
+                    length: 5,
+                    payload: Some(buf.freeze())
+                }
+            },
             PeerMessage::Request {
                 index,
                 begin,
@@ -299,8 +325,10 @@ impl Connection {
 #[derive(Debug)]
 pub enum PeerCommand {
     RequestPiece { index: u32 },
+    Have{ index: u32 },
     Exit,
 }
+
 #[derive(Debug)]
 pub enum PeerUpdate {
     Unchoked { peer_id: u8 },
@@ -402,6 +430,7 @@ pub async fn peer_handler(
     info: MetaInfo,
     mut commands: mpsc::Receiver<PeerCommand>,
     updates: mpsc::Sender<PeerUpdate>,
+    bits: BitVec<u8, Msb0>,
 ) -> Result<()> {
     // receive bitfield,  send interested,
     // wait for unchoke, then request block and wait for piece
@@ -413,8 +442,7 @@ pub async fn peer_handler(
     receive_handshake(&mut stream).await?;
     println!("Exchanged hanshake");
     let mut connection = Connection::new(stream);
-    let mut _choked = true;
-    let mut _bitfield: BitVec<u8, Msb0>;
+    connection.write_msg(&Message::from(PeerMessage::Bitfield { bits })).await?;
     let piece_size = info.info.piece_length;
     println!("Piece length: {}", piece_size);
 
@@ -430,7 +458,7 @@ pub async fn peer_handler(
                     None => {},
                     Some(msg) => {
                         match PeerMessage::from(msg) {
-                            PeerMessage::Choke => _choked = true,
+                            PeerMessage::Choke => updates.send(PeerUpdate::Unchoked{peer_id}).await?,
                             PeerMessage::Bitfield{bits} => {
                                 updates.send(PeerUpdate::Bitfield{peer_id, bits}).await?;
                                 connection.write_msg(&Message::from(PeerMessage::Interested{})).await?;
@@ -449,6 +477,13 @@ pub async fn peer_handler(
                                     updates.send(PeerUpdate::FinishedPiece{peer_id, index}).await?;
                                 }
                             }
+                            PeerMessage::Request{index, begin, length} => {
+                                let mut f = File::open(format!("piece{}", index))?;
+                                f.seek(SeekFrom::Start(begin as u64))?;
+                                let mut buf = BytesMut::with_capacity(length as usize).writer();
+                                io::copy(&mut f.take(length as u64), &mut buf)?;
+                                connection.write_msg(&Message::from(PeerMessage::Piece { index: index, begin: begin, data: buf.into_inner().freeze() })).await?;
+                            }
                             _ => unimplemented!()
                         }
                     }
@@ -462,6 +497,9 @@ pub async fn peer_handler(
                             connection.write_msg(&Message::from(PeerMessage::Request{index: index, begin: i * BLOCK_SIZE, length: BLOCK_SIZE})).await?;
                         }
                     },
+                    PeerCommand::Have{index} => {
+                        connection.write_msg(&Message::from(PeerMessage::Have(index))).await?;
+                    }
                     PeerCommand::Exit => { break; }
                 }
             },
