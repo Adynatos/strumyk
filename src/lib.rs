@@ -119,7 +119,7 @@ impl fmt::Display for MsgError {
 
 #[allow(dead_code)]
 #[derive(Debug)]
-enum PeerMessage {
+pub enum PeerMessage {
     Choke,
     Unchoke,
     Interested,
@@ -148,7 +148,7 @@ impl From<Message> for PeerMessage {
                 PeerMessage::Bitfield { bits: bv }
             }
             6 => {
-                let mut bytes = msg.payload.expect("Missing payload for bitfield");
+                let mut bytes = msg.payload.expect("Missing payload for request");
                 let index = bytes.get_u32();
                 let begin = bytes.get_u32();
                 let length = bytes.get_u32();
@@ -196,7 +196,7 @@ impl Message {
         let id = input.get_u8();
         //TODO: check if bytes length is correct
         let payload: Option<_>;
-        if length > 5 {
+        if length >= 5 {
             println!("Length: {}", length);
             let bytes = Bytes::copy_from_slice(&input.get_ref()[5..(length + 4) as usize]);
             println!("id: {}, payload: {}", id, bytes.len());
@@ -246,6 +246,17 @@ impl From<PeerMessage> for Message {
                     payload: Some(buf.freeze())
                 }
             },
+            PeerMessage::Bitfield{bits} => {
+                let mut buf = BytesMut::new();
+                let bv = bits.into_vec();
+                buf.extend_from_slice(&bv);
+                println!("Buf len: {}", buf.len());
+                Message {
+                    id: 5,
+                    length: 1+buf.len() as i32, //TODO:WTF
+                    payload: Some(buf.freeze())
+                }
+            },
             PeerMessage::Request {
                 index,
                 begin,
@@ -259,6 +270,19 @@ impl From<PeerMessage> for Message {
                     id: 6,
                     length: 13,
                     payload: Some(buf.freeze()),
+                }
+            }
+
+            PeerMessage::Piece { index, begin, data } => {
+                let mut buf = BytesMut::new();
+                buf.put_u32(index);
+                buf.put_u32(begin);
+                let len: i32 = data.len() as i32;
+                buf.extend(data);
+                Message {
+                    id: 7,
+                    length: 9 + len,
+                    payload: Some(buf.freeze())
                 }
             }
             _ => unimplemented!(),
@@ -294,7 +318,9 @@ impl Connection {
         }
     }
 
-    pub async fn write_msg(&mut self, msg: &Message) -> Result<()> {
+    pub async fn write_msg(&mut self, msg: PeerMessage) -> Result<()> {
+        println!("Sending {:?}", msg);
+        let msg = Message::from(msg);
         let mut buf = BytesMut::new();
         buf.put_i32(msg.length);
         buf.put_u8(msg.id);
@@ -334,6 +360,7 @@ pub enum PeerUpdate {
     Unchoked { peer_id: u8 },
     Choked { peer_id: u8 },
     Bitfield { peer_id: u8, bits: BitVec<u8, Msb0> },
+    Have{ peer_id: u8, index: u32 },
     FinishedPiece { peer_id: u8, index: u32 },
     Downloaded { peer_id: u8, bytes: u32 },
 }
@@ -343,14 +370,16 @@ pub struct BlockStorage {
     blocks: HashMap<u32, [Bytes; 16]>,
     completed: HashMap<u32, [bool; 16]>,
     info: Info,
+    workdir: String,
 }
 
 impl BlockStorage {
-    pub fn new(info: Info) -> BlockStorage {
+    pub fn new(info: Info, workdir: String) -> BlockStorage {
         BlockStorage {
             blocks: HashMap::new(),
             completed: HashMap::new(),
             info,
+            workdir
         }
     }
 
@@ -402,7 +431,7 @@ impl BlockStorage {
         //TODO: return result-failure, clear blocks
         assert_eq!(hs, hs2);
 
-        let filename = format!("piece{}", piece_idx);
+        let filename = format!("{}/piece{}", self.workdir, piece_idx);
         tokio::task::spawn_blocking(move || {
             let mut file = std::io::BufWriter::new(File::create(filename).unwrap());
             for block in buffer.iter() {
@@ -431,6 +460,7 @@ pub async fn peer_handler(
     mut commands: mpsc::Receiver<PeerCommand>,
     updates: mpsc::Sender<PeerUpdate>,
     bits: BitVec<u8, Msb0>,
+    workdir: String,
 ) -> Result<()> {
     // receive bitfield,  send interested,
     // wait for unchoke, then request block and wait for piece
@@ -442,7 +472,7 @@ pub async fn peer_handler(
     receive_handshake(&mut stream).await?;
     println!("Exchanged hanshake");
     let mut connection = Connection::new(stream);
-    connection.write_msg(&Message::from(PeerMessage::Bitfield { bits })).await?;
+    connection.write_msg(PeerMessage::Bitfield { bits }).await?;
     let piece_size = info.info.piece_length;
     println!("Piece length: {}", piece_size);
 
@@ -450,7 +480,7 @@ pub async fn peer_handler(
     let mut downloaded_bytes = 0;
     let mut interval_timer = time::interval(Duration::from_secs(1));
 
-    let mut block_storage = BlockStorage::new(info.info.clone());
+    let mut block_storage = BlockStorage::new(info.info.clone(), workdir.clone());
     loop {
         tokio::select! {
             msg =  connection.read_msg() => {
@@ -461,7 +491,7 @@ pub async fn peer_handler(
                             PeerMessage::Choke => updates.send(PeerUpdate::Unchoked{peer_id}).await?,
                             PeerMessage::Bitfield{bits} => {
                                 updates.send(PeerUpdate::Bitfield{peer_id, bits}).await?;
-                                connection.write_msg(&Message::from(PeerMessage::Interested{})).await?;
+                                connection.write_msg(PeerMessage::Interested{}).await?;
                             },
                             PeerMessage::Unchoke => {
                                 updates.send(PeerUpdate::Unchoked{peer_id}).await?;
@@ -478,13 +508,22 @@ pub async fn peer_handler(
                                 }
                             }
                             PeerMessage::Request{index, begin, length} => {
-                                let mut f = File::open(format!("piece{}", index))?;
+                                let mut f = File::open(format!("{}/piece{}", workdir, index))?;
                                 f.seek(SeekFrom::Start(begin as u64))?;
                                 let mut buf = BytesMut::with_capacity(length as usize).writer();
                                 io::copy(&mut f.take(length as u64), &mut buf)?;
-                                connection.write_msg(&Message::from(PeerMessage::Piece { index: index, begin: begin, data: buf.into_inner().freeze() })).await?;
+                                connection.write_msg(PeerMessage::Piece { index: index, begin: begin, data: buf.into_inner().freeze() }).await?;
+                            },
+                            PeerMessage::Have(piece) => {
+                                updates.send(PeerUpdate::Have { peer_id, index: piece }).await?;
+                            },
+                            PeerMessage::Interested => {
+                                connection.write_msg(PeerMessage::Unchoke{}).await?;
                             }
-                            _ => unimplemented!()
+                            pms => {
+                                println!("Unexpected msg: {:?}", pms);
+                                unimplemented!()
+                            }
                         }
                     }
                 }
@@ -493,12 +532,12 @@ pub async fn peer_handler(
                 match cmd {
                     PeerCommand::RequestPiece{index} => {
                         //TODO: this is quite inefficient - move to dedicated block level picker that will drive this
-                        for i in 0..(reqs_per_piece+1) as u32 {
-                            connection.write_msg(&Message::from(PeerMessage::Request{index: index, begin: i * BLOCK_SIZE, length: BLOCK_SIZE})).await?;
+                        for i in 0..(reqs_per_piece) as u32 {
+                            connection.write_msg(PeerMessage::Request{index: index, begin: i * BLOCK_SIZE, length: BLOCK_SIZE}).await?;
                         }
                     },
                     PeerCommand::Have{index} => {
-                        connection.write_msg(&Message::from(PeerMessage::Have(index))).await?;
+                        connection.write_msg(PeerMessage::Have(index)).await?;
                     }
                     PeerCommand::Exit => { break; }
                 }
@@ -547,6 +586,15 @@ impl PiecePicker {
         self.sort()
     }
 
+    pub fn have(&mut self, peer_id: u8, piece: u32) {
+        if let Some(v) = self.pieces.get_mut(&(piece as u32)) {
+            v.push(peer_id)
+        } else {
+            self.pieces.insert(piece as u32, vec![peer_id]);
+            self.pieces_by_rarity.push_back(piece as u32);
+        }
+    }
+
     fn sort(&mut self) {
         self.pieces_by_rarity
             .make_contiguous()
@@ -563,7 +611,7 @@ impl PiecePicker {
         self.completed.all()
     }
 
-    pub fn next(&mut self, peer: PeerId) -> u32 {
+    pub fn next(&mut self, peer: PeerId) -> Option<u32> {
         for (idx, piece_idx) in self.pieces_by_rarity.clone().iter().enumerate() {
             let piece = self.pieces.get(&piece_idx);
             if let Some(piece) = piece {
@@ -571,11 +619,12 @@ impl PiecePicker {
                     self.pieces_by_rarity.remove(idx);
                     //todo: move to finished when we add timeouts
                     self.completed.set(*piece_idx as usize, true);
-                    return *piece_idx;
+                    return Some(*piece_idx);
                 }
             }
         }
-        panic!("Error somehow we don't have piece for peer!")
+        println!("Error somehow we don't have piece for peer!");
+        None
     }
 }
 
