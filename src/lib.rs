@@ -13,6 +13,7 @@ use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::error::Error;
+use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
 use std::io::SeekFrom;
@@ -118,7 +119,6 @@ impl fmt::Display for MsgError {
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
 pub enum PeerMessage {
     Choke,
     Unchoke,
@@ -129,6 +129,22 @@ pub enum PeerMessage {
     Request { index: u32, begin: u32, length: u32 },
     Piece { index: u32, begin: u32, data: Bytes },
     Cancel { index: u32, begin: u32, length: u32 },
+}
+
+impl Display for PeerMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PeerMessage::Choke => write!(f, "PeerMessage::Choke"),
+            PeerMessage::Unchoke =>  write!(f, "PeerMessage::Unchoke"),
+            PeerMessage::Interested =>  write!(f, "PeerMessage::Interested"),
+            PeerMessage::NotInterested =>  write!(f, "PeerMessage::NotInterested"),
+            PeerMessage::Have(_) =>  write!(f, "PeerMessage::Have"),
+            PeerMessage::Bitfield { .. } =>  write!(f, "PeerMessage::Bitfield"),
+            PeerMessage::Request { .. } =>  write!(f, "PeerMessage::Request"),
+            PeerMessage::Piece { .. } =>  write!(f, "PeerMessage::Piece"),
+            PeerMessage::Cancel { .. } =>  write!(f, "PeerMessage::Cancel"),
+        }
+    }
 }
 
 impl From<Message> for PeerMessage {
@@ -177,13 +193,18 @@ pub struct Message {
     payload: Option<Bytes>,
 }
 
+impl Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Message id: {}, len: {}", self.id, self.length)
+    }
+}
+
 impl Message {
     pub fn check(input: &mut Cursor<&[u8]>) -> std::result::Result<(), MsgError> {
         if input.remaining() < 4 {
             return Err(MsgError::Incomplete);
         }
         let len = input.get_i32();
-        println!("check length: {}", len);
         if input.remaining() < len as usize {
             return Err(MsgError::Incomplete);
         }
@@ -197,9 +218,7 @@ impl Message {
         //TODO: check if bytes length is correct
         let payload: Option<_>;
         if length >= 5 {
-            println!("Length: {}", length);
             let bytes = Bytes::copy_from_slice(&input.get_ref()[5..(length + 4) as usize]);
-            println!("id: {}, payload: {}", id, bytes.len());
             input.advance(bytes.remaining());
             payload = Some(bytes);
         } else {
@@ -250,7 +269,6 @@ impl From<PeerMessage> for Message {
                 let mut buf = BytesMut::new();
                 let bv = bits.into_vec();
                 buf.extend_from_slice(&bv);
-                println!("Buf len: {}", buf.len());
                 Message {
                     id: 5,
                     length: 1+buf.len() as i32, //TODO:WTF
@@ -305,6 +323,7 @@ impl Connection {
     pub async fn read_msg(&mut self) -> Result<Option<Message>> {
         loop {
             if let Some(msg) = self.parse_msg()? {
+                println!("Received: {}", msg);
                 return Ok(Some(msg));
             }
 
@@ -319,7 +338,7 @@ impl Connection {
     }
 
     pub async fn write_msg(&mut self, msg: PeerMessage) -> Result<()> {
-        println!("Sending {:?}", msg);
+        println!("Sending: {}", msg);
         let msg = Message::from(msg);
         let mut buf = BytesMut::new();
         buf.put_i32(msg.length);
@@ -507,6 +526,7 @@ pub async fn peer_handler(
                                     updates.send(PeerUpdate::FinishedPiece{peer_id, index}).await?;
                                 }
                             }
+                            //TODO: check if we have that
                             PeerMessage::Request{index, begin, length} => {
                                 let mut f = File::open(format!("{}/piece{}", workdir, index))?;
                                 f.seek(SeekFrom::Start(begin as u64))?;
@@ -521,7 +541,7 @@ pub async fn peer_handler(
                                 connection.write_msg(PeerMessage::Unchoke{}).await?;
                             }
                             pms => {
-                                println!("Unexpected msg: {:?}", pms);
+                                println!("Unexpected msg: {}", pms);
                                 unimplemented!()
                             }
                         }
@@ -593,6 +613,8 @@ impl PiecePicker {
             self.pieces.insert(piece as u32, vec![peer_id]);
             self.pieces_by_rarity.push_back(piece as u32);
         }
+
+        self.sort();
     }
 
     fn sort(&mut self) {

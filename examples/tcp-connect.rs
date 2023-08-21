@@ -117,6 +117,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         break;
                     }
+                    //TODO: Remove command channels for disconnected peers
                     for tx in commands.values() {
                         tx.send(PeerCommand::Have{index}).await?;
                     }
@@ -141,7 +142,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("Queue size: {}", max_outstanding_reqs);
                 }
                 PeerUpdate::Bitfield { peer_id, bits } => piece_picker.update(peer_id, bits),
-                PeerUpdate::Have{peer_id, index} => piece_picker.have(peer_id, index),
+                PeerUpdate::Have{peer_id, index} => {
+                    piece_picker.have(peer_id, index);
+                    //TODO: deduplicate!
+                    if !choked {
+                        if queued_requests < max_outstanding_reqs {
+                            if let Some(piece_idx) = piece_picker.next(peer_id) {
+                                queued_requests += 1;
+                                commands[&peer_id]
+                                    .send(PeerCommand::RequestPiece { index: piece_idx })
+                                    .await?;
+                            }
+                        }
+                    }
+                }
             }
         },
         else => break,
