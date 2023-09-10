@@ -15,7 +15,9 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::Display;
 use std::fs::File;
+use std::io;
 use std::io::Read;
+use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
@@ -26,8 +28,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
-use std::io::Seek;
-use std::io;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -135,14 +135,14 @@ impl Display for PeerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PeerMessage::Choke => write!(f, "PeerMessage::Choke"),
-            PeerMessage::Unchoke =>  write!(f, "PeerMessage::Unchoke"),
-            PeerMessage::Interested =>  write!(f, "PeerMessage::Interested"),
-            PeerMessage::NotInterested =>  write!(f, "PeerMessage::NotInterested"),
-            PeerMessage::Have(_) =>  write!(f, "PeerMessage::Have"),
-            PeerMessage::Bitfield { .. } =>  write!(f, "PeerMessage::Bitfield"),
-            PeerMessage::Request { .. } =>  write!(f, "PeerMessage::Request"),
-            PeerMessage::Piece { .. } =>  write!(f, "PeerMessage::Piece"),
-            PeerMessage::Cancel { .. } =>  write!(f, "PeerMessage::Cancel"),
+            PeerMessage::Unchoke => write!(f, "PeerMessage::Unchoke"),
+            PeerMessage::Interested => write!(f, "PeerMessage::Interested"),
+            PeerMessage::NotInterested => write!(f, "PeerMessage::NotInterested"),
+            PeerMessage::Have(_) => write!(f, "PeerMessage::Have"),
+            PeerMessage::Bitfield { .. } => write!(f, "PeerMessage::Bitfield"),
+            PeerMessage::Request { .. } => write!(f, "PeerMessage::Request"),
+            PeerMessage::Piece { .. } => write!(f, "PeerMessage::Piece"),
+            PeerMessage::Cancel { .. } => write!(f, "PeerMessage::Cancel"),
         }
     }
 }
@@ -153,7 +153,7 @@ impl From<Message> for PeerMessage {
             0 => PeerMessage::Choke {},
             1 => PeerMessage::Unchoke {},
             2 => PeerMessage::Interested {},
-            3 => PeerMessage::NotInterested{},
+            3 => PeerMessage::NotInterested {},
             4 => {
                 let mut bytes = msg.payload.expect("Missing payload for Have");
                 PeerMessage::Have(bytes.get_u32())
@@ -168,7 +168,11 @@ impl From<Message> for PeerMessage {
                 let index = bytes.get_u32();
                 let begin = bytes.get_u32();
                 let length = bytes.get_u32();
-                PeerMessage::Request { index, begin, length}
+                PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                }
             }
             7 => {
                 let mut bytes = msg.payload.expect("Missing payload for pieces");
@@ -262,19 +266,19 @@ impl From<PeerMessage> for Message {
                 Message {
                     id: 4,
                     length: 5,
-                    payload: Some(buf.freeze())
+                    payload: Some(buf.freeze()),
                 }
-            },
-            PeerMessage::Bitfield{bits} => {
+            }
+            PeerMessage::Bitfield { bits } => {
                 let mut buf = BytesMut::new();
                 let bv = bits.into_vec();
                 buf.extend_from_slice(&bv);
                 Message {
                     id: 5,
-                    length: 1+buf.len() as i32, //TODO:WTF
-                    payload: Some(buf.freeze())
+                    length: 1 + buf.len() as i32, //TODO:WTF
+                    payload: Some(buf.freeze()),
                 }
-            },
+            }
             PeerMessage::Request {
                 index,
                 begin,
@@ -300,7 +304,7 @@ impl From<PeerMessage> for Message {
                 Message {
                     id: 7,
                     length: 9 + len,
-                    payload: Some(buf.freeze())
+                    payload: Some(buf.freeze()),
                 }
             }
             _ => unimplemented!(),
@@ -370,7 +374,7 @@ impl Connection {
 #[derive(Debug)]
 pub enum PeerCommand {
     RequestPiece { index: u32 },
-    Have{ index: u32 },
+    Have { index: u32 },
     Exit,
 }
 
@@ -379,7 +383,7 @@ pub enum PeerUpdate {
     Unchoked { peer_id: u8 },
     Choked { peer_id: u8 },
     Bitfield { peer_id: u8, bits: BitVec<u8, Msb0> },
-    Have{ peer_id: u8, index: u32 },
+    Have { peer_id: u8, index: u32 },
     FinishedPiece { peer_id: u8, index: u32 },
     Downloaded { peer_id: u8, bytes: u32 },
 }
@@ -398,7 +402,7 @@ impl BlockStorage {
             blocks: HashMap::new(),
             completed: HashMap::new(),
             info,
-            workdir
+            workdir,
         }
     }
 
@@ -582,9 +586,9 @@ pub struct PiecePicker {
 }
 
 impl PiecePicker {
-    pub fn new(num_of_pieces: u32, completed: BitVec<u8, Msb0>) -> Self {
+    pub fn new(completed: BitVec<u8, Msb0>) -> Self {
         let pieces = HashMap::new();
-        let pieces_by_rarity = VecDeque::with_capacity(num_of_pieces as usize);
+        let pieces_by_rarity = VecDeque::with_capacity(completed.len() as usize);
         PiecePicker {
             pieces,
             pieces_by_rarity,
